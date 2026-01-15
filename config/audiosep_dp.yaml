@@ -20,9 +20,12 @@ data:
 model:
     query_net: CLAP
     condition_size: 512
-    model_type: ResUNet30
-    input_channels: 4
-    output_channels: 4
+    dprnn: True
+    dprnn_hidden: 256
+    dprnn_layers: 6
+    model_type: ResUNet30_DP
+    input_channels: 1
+    output_channels: 1
     resume_checkpoint: ""
     use_text_ratio: 1.0
 

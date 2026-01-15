@@ -7,6 +7,71 @@ from torchlibrosa.stft import STFT, ISTFT, magphase
 from models.base import Base, init_layer, init_bn, act
 
 
+class mFiLM(nn.Module):
+    """Multi-condition FiLM with self-attention."""
+    def __init__(self, film_meta, condition_size, num_heads=4):
+        super(mFiLM, self).__init__()
+        
+        self.condition_size = condition_size
+        self.num_heads = num_heads
+        
+        # Self-attention for multiple conditions
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=condition_size,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        
+        self.modules, _ = self.create_film_modules(film_meta, [])
+        
+    def create_film_modules(self, film_meta, ancestor_names):
+        modules = {}
+        for module_name, value in film_meta.items():
+            if isinstance(value, int):
+                ancestor_names.append(module_name)
+                unique_module_name = '->'.join(ancestor_names)
+                layer = nn.Linear(self.condition_size, value)
+                init_layer(layer)
+                self.add_module(name=unique_module_name, module=layer)
+                modules[module_name] = layer
+            elif isinstance(value, dict):
+                ancestor_names.append(module_name)
+                modules[module_name], _ = self.create_film_modules(value, ancestor_names)
+            ancestor_names.pop()
+        return modules, ancestor_names
+    
+    def forward(self, conditions):
+        """
+        Args:
+            conditions: (batch_size, num_conditions, condition_size) or (batch_size, condition_size)
+        Returns:
+            film_dict: Dictionary of FiLM parameters
+        """
+        # Handle single condition case
+        if conditions.dim() == 2:
+            conditions = conditions.unsqueeze(1)  # (batch_size, 1, condition_size)
+        
+        # Apply self-attention across conditions
+        attn_out, _ = self.self_attn(conditions, conditions, conditions)
+        # (batch_size, num_conditions, condition_size)
+        
+        # Aggregate: mean pooling across conditions
+        aggregated = attn_out.mean(dim=1)  # (batch_size, condition_size)
+        
+        # Generate FiLM parameters
+        film_dict = self.calculate_film_data(aggregated, self.modules)
+        return film_dict
+    
+    def calculate_film_data(self, conditions, modules):
+        film_data = {}
+        for module_name, module in modules.items():
+            if isinstance(module, nn.Module):
+                film_data[module_name] = module(conditions)[:, :, None, None]
+            elif isinstance(module, dict):
+                film_data[module_name] = self.calculate_film_data(conditions, module)
+        return film_data
+
+
 class FiLM(nn.Module):
     def __init__(self, film_meta, condition_size):
         super(FiLM, self).__init__()
@@ -619,7 +684,7 @@ def get_film_meta(module):
 
 
 class ResUNet30(nn.Module):
-    def __init__(self, input_channels, output_channels, condition_size):
+    def __init__(self, input_channels, output_channels, condition_size, num_conditions):
         super(ResUNet30, self).__init__()
 
         self.base = ResUNet30_Base(
@@ -630,11 +695,17 @@ class ResUNet30(nn.Module):
         self.film_meta = get_film_meta(
             module=self.base,
         )
-        
-        self.film = FiLM(
-            film_meta=self.film_meta, 
-            condition_size=condition_size
-        )
+        if num_conditions > 1:
+            self.film = mFiLM(
+                film_meta=self.film_meta, 
+                condition_size=condition_size,
+                num_heads=4,
+            )
+        else:
+            self.film = FiLM(
+                film_meta=self.film_meta, 
+                condition_size=condition_size
+            )
 
 
     def forward(self, input_dict):

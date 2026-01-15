@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import pathlib
+import torch
 from typing import List, NoReturn
 import lightning.pytorch as pl
 from lightning.pytorch.strategies import DDPStrategy
@@ -70,7 +71,6 @@ def get_dirs(
         filename,
         "{},devices={}".format(yaml_name, devices_num),
     )
-
     # Directory to save statistics
     statistics_path = os.path.join(
         workspace,
@@ -81,6 +81,9 @@ def get_dirs(
     )
     os.makedirs(os.path.dirname(statistics_path), exist_ok=True)
 
+    # log basic run info
+    logging.info(f"get_dirs: workspace={workspace}, config_yaml={config_yaml}, filename={filename}, devices_num={devices_num}")
+
     return checkpoints_dir, logs_dir, tf_logs_dir, statistics_path
 
  
@@ -88,6 +91,7 @@ def get_data_module(
     config_yaml: str,
     num_workers: int,
     batch_size: int,
+    test_mode: bool = False,
 ) -> DataModule:
     r"""Create data_module. Mini-batch data can be obtained by:
 
@@ -115,13 +119,13 @@ def get_data_module(
     sampling_rate = configs['data']['sampling_rate']
     segment_seconds = configs['data']['segment_seconds']
     
-    # audio-text datasets
     datafiles = configs['data']['datafiles']
     
     # dataset
     dataset = AudioTextDataset(
         datafiles=datafiles, 
         sampling_rate=sampling_rate, 
+        num_channels=configs['data']['num_channels'] if 'num_channels' in configs['data'] else 1,
         max_clip_len=segment_seconds,
     )
     
@@ -132,6 +136,16 @@ def get_data_module(
         num_workers=num_workers,
         batch_size=batch_size
     )
+    
+    # Setup separate validation dataset if val_datafiles specified
+    if 'val_datafiles' in configs['data']:
+        val_dataset = AudioTextDataset(
+            datafiles=configs['data']['val_datafiles'], 
+            sampling_rate=sampling_rate, 
+            num_channels=configs['data']['num_channels'] if 'num_channels' in configs['data'] else 1,
+            max_clip_len=segment_seconds,
+        )
+        data_module.val_dataset = val_dataset
 
     return data_module
 
@@ -156,6 +170,7 @@ def train(args) -> NoReturn:
 
     # Configuration of data
     max_mix_num = configs['data']['max_mix_num']
+    num_conditions = configs['data'].get('num_conditions', 1)
     sampling_rate = configs['data']['sampling_rate']
     lower_db = configs['data']['loudness_norm']['lower_db']
     higher_db = configs['data']['loudness_norm']['higher_db']
@@ -180,6 +195,7 @@ def train(args) -> NoReturn:
     warm_up_steps = configs['train']["optimizer"]['warm_up_steps']
     reduce_lr_steps = configs['train']["optimizer"]['reduce_lr_steps']
     save_step_frequency = configs['train']['save_step_frequency']
+    evaluate_step_frequency = configs['train'].get('evaluate_step_frequency', save_step_frequency)
     resume_checkpoint_path = args.resume_checkpoint_path
     if resume_checkpoint_path == "":
         resume_checkpoint_path = None
@@ -207,6 +223,7 @@ def train(args) -> NoReturn:
         input_channels=input_channels,
         output_channels=output_channels,
         condition_size=condition_size,
+        num_conditions=configs['data'].get('num_conditions', 1)
     )
 
     # loss function
@@ -215,7 +232,8 @@ def train(args) -> NoReturn:
     segment_mixer = SegmentMixer(
         max_mix_num=max_mix_num,
         lower_db=lower_db, 
-        higher_db=higher_db
+        higher_db=higher_db,
+        num_conditions=num_conditions,
     )
 
     
@@ -262,6 +280,7 @@ def train(args) -> NoReturn:
         fast_dev_run=False,
         max_epochs=-1,
         log_every_n_steps=50,
+        val_check_interval=evaluate_step_frequency,
         use_distributed_sampler=True,
         sync_batchnorm=sync_batchnorm,
         num_sanity_val_steps=2,
@@ -280,6 +299,114 @@ def train(args) -> NoReturn:
     )
 
 
+def eval(args) -> NoReturn:
+    r"""Run evaluation only (validate/test) using a checkpoint if provided.
+
+    This function mirrors the model + datamodule setup in `train` but
+    only runs validation. It supports loading a checkpoint via
+    `args.resume_checkpoint_path`.
+    """
+
+    # arguments & parameters
+    workspace = args.workspace
+    config_yaml = args.config_yaml
+    filename = args.filename
+
+    devices_num = torch.cuda.device_count()
+    # Read config file.
+    configs = parse_yaml(config_yaml)
+
+    # Configuration of data
+    sampling_rate = configs['data']['sampling_rate']
+
+    # Configuration of the separation model
+    query_net = configs['model']['query_net']
+    model_type = configs['model']['model_type']
+    input_channels = configs['model']['input_channels']
+    output_channels = configs['model']['output_channels']
+    condition_size = configs['model']['condition_size']
+    use_text_ratio = configs['model'].get('use_text_ratio', False)
+
+    # Configuration of the trainer
+    batch_size = configs['train']['batch_size_per_device']
+    num_workers = configs['train']['num_workers']
+    resume_checkpoint_path = args.resume_checkpoint_path
+    if resume_checkpoint_path == "":
+        resume_checkpoint_path = None
+    else:
+        logging.info(f'Loading checkpoint for evaluation [{resume_checkpoint_path}]')
+
+    # data module
+    data_module = get_data_module(
+        config_yaml=config_yaml,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+    # model
+    Model = get_model_class(model_type=model_type)
+
+    ss_model = Model(
+        input_channels=input_channels,
+        output_channels=output_channels,
+        condition_size=condition_size,
+        num_conditions=configs['data'].get('num_conditions', 1)
+    )
+
+    # loss function (not strictly needed for eval but kept for parity)
+    loss_function = get_loss_function(configs['train']['loss_type'])
+
+    segment_mixer = SegmentMixer(
+        max_mix_num=configs['data']['max_mix_num'],
+        lower_db=configs['data']['loudness_norm']['lower_db'], 
+        higher_db=configs['data']['loudness_norm']['higher_db'],
+        num_conditions=configs['data'].get('num_conditions', 1),
+    )
+
+    if query_net == 'CLAP':
+        query_encoder = CLAP_Encoder()
+    else:
+        raise NotImplementedError
+
+    lr_lambda_func = get_lr_lambda(
+        lr_lambda_type=configs['train']["optimizer"]['lr_lambda_type'],
+        warm_up_steps=configs['train']["optimizer"]['warm_up_steps'],
+        reduce_lr_steps=configs['train']["optimizer"]['reduce_lr_steps'],
+    )
+
+    # pytorch-lightning model
+    pl_model = AudioSep(
+        ss_model=ss_model,
+        waveform_mixer=segment_mixer,
+        query_encoder=query_encoder,
+        loss_function=loss_function,
+        optimizer_type=configs['train']["optimizer"]["optimizer_type"],
+        learning_rate=float(configs['train']["optimizer"]['learning_rate']),
+        lr_lambda_func=lr_lambda_func,
+        use_text_ratio=use_text_ratio,
+    )
+
+    trainer = pl.Trainer(
+        accelerator='auto',
+        devices='auto',
+        strategy='ddp_find_unused_parameters_true',
+        precision="32-true",
+        logger=None,
+        enable_checkpointing=False,
+        enable_progress_bar=True,
+    )
+
+    # Run validation (loads checkpoint if ckpt_path provided)
+    logging.info("Starting evaluation (validate)")
+    results = trainer.validate(
+        model=pl_model,
+        datamodule=data_module,
+        ckpt_path=resume_checkpoint_path,
+    )
+
+    logging.info(f"Validation results: {results}")
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -296,12 +423,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resume_checkpoint_path",
         type=str,
-        required=True,
+        required=False,
         default='',
-        help="Path of pretrained checkpoint for finetuning.",
+        help="Path of pretrained checkpoint for finetuning or evaluation (optional).",
+    )
+
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Run evaluation only using the provided checkpoint (no training).",
     )
 
     args = parser.parse_args()
     args.filename = pathlib.Path(__file__).stem
 
-    train(args)
+    if args.eval_only:
+        eval(args)
+    else:
+        train(args)

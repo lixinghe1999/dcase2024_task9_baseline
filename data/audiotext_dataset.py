@@ -15,6 +15,7 @@ class AudioTextDataset(Dataset):
         self,
         datafiles=[''], 
         sampling_rate=32000, 
+        num_channels=1,
         max_clip_len=5,
     ):
         all_data_json = []
@@ -25,6 +26,7 @@ class AudioTextDataset(Dataset):
         self.all_data_json = all_data_json
 
         self.sampling_rate = sampling_rate
+        self.num_channels = num_channels
         self.max_length = max_clip_len * sampling_rate
 
     def __len__(self):
@@ -68,20 +70,30 @@ class AudioTextDataset(Dataset):
         text, audio_data, audio_rate = self._read_audio(index)
         audio_len = audio_data.shape[1] / audio_rate
         # convert stero to single channel
-        if audio_data.shape[0] > 1:
-            # audio_data: [samples]
-            audio_data = (audio_data[0] + audio_data[1]) / 2
-        else:
-            audio_data = audio_data.squeeze(0)
-        
-        # resample audio clip
-        if audio_rate != self.sampling_rate:
-            audio_data = torchaudio.functional.resample(audio_data, orig_freq=audio_rate, new_freq=self.sampling_rate)
-        
-        audio_data = audio_data.unsqueeze(0)
-        
-        audio_data = self._cut_or_randomcrop(audio_data)            
-
+        if self.num_channels > 1:
+            if audio_data.shape[0] == 1: # fake multi-channel
+                audio_data = create_synthetic_multichannel(audio_data, num_channels=4, sr=self.sampling_rate, max_delay_ms=50, gain_range=(0.5, 1.5))
+            elif audio_data.shape[0] == self.num_channels:
+                pass
+            else:
+                raise ValueError(f"audio channels {audio_data.shape[0]} not match the required num_channels {self.num_channels}")
+            if audio_rate != self.sampling_rate:
+                audio_data = torchaudio.functional.resample(audio_data, orig_freq=audio_rate, new_freq=self.sampling_rate)
+            audio_data = self._cut_or_randomcrop(audio_data)
+        else: # mono
+            if audio_data.shape[0] > 1:
+                # audio_data: [samples]
+                audio_data = (audio_data[0] + audio_data[1]) / 2
+            else:
+                audio_data = audio_data.squeeze(0)
+            
+            # resample audio clip
+            if audio_rate != self.sampling_rate:
+                audio_data = torchaudio.functional.resample(audio_data, orig_freq=audio_rate, new_freq=self.sampling_rate)
+            
+            audio_data = audio_data.unsqueeze(0)
+            
+            audio_data = self._cut_or_randomcrop(audio_data)      
         data_dict = {
             'text': text, 
             'waveform': audio_data,  
@@ -89,3 +101,32 @@ class AudioTextDataset(Dataset):
         }
 
         return data_dict
+
+
+def create_synthetic_multichannel(audio, num_channels=4, sr=16000, max_delay_ms=50, gain_range=(0.5, 1.5)):
+    """
+    Create synthetic multi-channel audio with random channel-wise delays and gains.
+    
+    Args:
+        audio: (samples,) or (1, samples) tensor, mono audio input
+        num_channels: Number of output channels
+        sr: Sample rate
+        max_delay_ms: Maximum random delay in milliseconds
+        gain_range: Tuple of (min_gain, max_gain) for random scaling
+    
+    Returns:
+        multichannel: (num_channels, samples) tensor
+    """
+    if audio.dim() > 1:
+        audio = audio.squeeze()
+    
+    max_delay_samples = int(max_delay_ms * sr / 1000)
+    output_length = audio.size(0) + max_delay_samples
+    multichannel = torch.zeros(num_channels, output_length)
+    
+    for ch in range(num_channels):
+        delay = random.randint(0, max_delay_samples)
+        gain = random.uniform(*gain_range)
+        multichannel[ch, delay:delay + audio.size(0)] = audio * gain
+    
+    return multichannel

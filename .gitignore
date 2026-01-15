@@ -1,0 +1,6 @@
+*.pyc
+*.json
+*.out
+checkpoint/
+workspace/
+lightning_logs/

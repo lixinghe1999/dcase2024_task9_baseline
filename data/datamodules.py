@@ -50,6 +50,12 @@ class DataModule(pl.LightningDataModule):
         # On multiple devices, each SegmentSampler samples a part of mini-batch
         # data.
         self.train_dataset = self._train_dataset
+        # By default, use the same dataset for validation/test unless user
+        # supplies separate ones by assigning attributes before calling setup.
+        if not hasattr(self, 'val_dataset'):
+            self.val_dataset = self.train_dataset
+        if not hasattr(self, 'test_dataset'):
+            self.test_dataset = self.train_dataset
         
         
     def train_dataloader(self) -> torch.utils.data.DataLoader:
@@ -67,16 +73,33 @@ class DataModule(pl.LightningDataModule):
         return train_loader
 
     def val_dataloader(self):
-        # val_split = Dataset(...)
-        # return DataLoader(val_split)
-        pass
+        # Return a validation dataloader. Use same collate_fn, no shuffling.
+        val_loader = DataLoader(
+            dataset=self.val_dataset,
+            batch_size=self.batch_size,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=False,
+            shuffle=False,
+        )
+
+        return val_loader
 
     def test_dataloader(self):
-        # test_split = Dataset(...)
-        # return DataLoader(test_split)
-        pass
+        test_loader = DataLoader(
+            dataset=self.test_dataset,
+            batch_size=self.batch_size,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=False,
+            shuffle=False,
+        )
 
-    def teardown(self):
+        return test_loader
+
+    def teardown(self, stage: Optional[str] = None) -> NoReturn:
         # clean up after fit or test
         # called on every process in DDP
         pass

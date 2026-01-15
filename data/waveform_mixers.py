@@ -7,59 +7,116 @@ import pyloudnorm as pyln
 
 
 class SegmentMixer(nn.Module):
-    def __init__(self, max_mix_num, lower_db, higher_db):
+    def __init__(self, max_mix_num, lower_db, higher_db, num_conditions=1):
         super(SegmentMixer, self).__init__()
 
         self.max_mix_num = max_mix_num
+        self.num_conditions = num_conditions
         self.loudness_param = {
             'lower_db': lower_db,
             'higher_db': higher_db,
         }
 
+    # def __call__(self, waveforms):
+        
+    #     batch_size = waveforms.shape[0]
+
+    #     data_dict = {
+    #         'segment': [],
+    #         'mixture': [],
+    #     }
+
+    #     for n in range(0, batch_size):
+
+    #         segment = waveforms[n].clone()
+
+    #         # create zero tensors as the background template
+    #         noise = torch.zeros_like(segment)
+
+    #         mix_num = random.randint(2, self.max_mix_num)
+    #         assert mix_num >= 2
+
+    #         for i in range(1, mix_num):
+    #             next_segment = waveforms[(n + i) % batch_size]
+    #             rescaled_next_segment = dynamic_loudnorm(audio=next_segment, reference=segment, **self.loudness_param)
+    #             noise += rescaled_next_segment
+
+    #         # randomly normalize background noise
+    #         noise = dynamic_loudnorm(audio=noise, reference=segment, **self.loudness_param)
+
+    #         # create audio mixyure
+    #         mixture = segment + noise
+
+    #         # declipping if need be
+    #         max_value = torch.max(torch.abs(mixture))
+    #         if max_value > 1:
+    #             segment *= 0.9 / max_value
+    #             mixture *= 0.9 / max_value
+
+    #         data_dict['segment'].append(segment)
+    #         data_dict['mixture'].append(mixture)
+
+    #     for key in data_dict.keys():
+    #         data_dict[key] = torch.stack(data_dict[key], dim=0)
+
+    #     # return data_dict
+    #     return data_dict['mixture'], data_dict['segment']
+    
     def __call__(self, waveforms):
         
         batch_size = waveforms.shape[0]
 
         data_dict = {
-            'segment': [],
+            'target': [],
             'mixture': [],
+            'target_indices': [],
         }
 
         for n in range(0, batch_size):
 
-            segment = waveforms[n].clone()
+            # randomly select number of target sources
+            num_targets = random.randint(1, self.num_conditions)
+            num_targets = self.num_conditions
 
-            # create zero tensors as the background template
-            noise = torch.zeros_like(segment)
+            # create target mixture from multiple sources
+            target = torch.zeros_like(waveforms[n])
+            target_idx = []
+            
+            for i in range(num_targets):
+                idx = (n + i) % batch_size
+                segment = waveforms[idx].clone()
+                target += segment
+                target_idx.append(idx)
 
-            mix_num = random.randint(2, self.max_mix_num)
-            assert mix_num >= 2
-
-            for i in range(1, mix_num):
+            # create background noise
+            noise = torch.zeros_like(waveforms[n])
+            mix_num = random.randint(num_targets+1, self.max_mix_num)
+            
+            for i in range(num_targets, mix_num):
                 next_segment = waveforms[(n + i) % batch_size]
-                rescaled_next_segment = dynamic_loudnorm(audio=next_segment, reference=segment, **self.loudness_param)
+                rescaled_next_segment = dynamic_loudnorm(audio=next_segment, reference=waveforms[n], **self.loudness_param)
                 noise += rescaled_next_segment
+            # normalize background noise
+            noise = dynamic_loudnorm(audio=noise, reference=target, **self.loudness_param)
 
-            # randomly normalize background noise
-            noise = dynamic_loudnorm(audio=noise, reference=segment, **self.loudness_param)
+            # create audio mixture
+            mixture = target + noise
 
-            # create audio mixyure
-            mixture = segment + noise
-
-            # declipping if need be
+            # declipping if needed
             max_value = torch.max(torch.abs(mixture))
             if max_value > 1:
-                segment *= 0.9 / max_value
+                target *= 0.9 / max_value
                 mixture *= 0.9 / max_value
 
-            data_dict['segment'].append(segment)
+            data_dict['target'].append(target)
             data_dict['mixture'].append(mixture)
+            data_dict['target_indices'].append(target_idx)
 
         for key in data_dict.keys():
-            data_dict[key] = torch.stack(data_dict[key], dim=0)
-
-        # return data_dict
-        return data_dict['mixture'], data_dict['segment']
+            if key != 'target_indices':
+                data_dict[key] = torch.stack(data_dict[key], dim=0)
+        
+        return data_dict['mixture'], data_dict['target'], data_dict['target_indices']
 
 
 def rescale_to_match_energy(segment1, segment2):

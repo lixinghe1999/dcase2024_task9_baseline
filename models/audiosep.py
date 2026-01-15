@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
-
+import torchmetrics
 from models.clap_encoder import CLAP_Encoder
 
 from huggingface_hub import PyTorchModelHubMixin
@@ -44,7 +44,8 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         self.optimizer_type = optimizer_type
         self.learning_rate = learning_rate
         self.lr_lambda_func = lr_lambda_func
-
+        from torchmetrics.audio.snr import SignalNoiseRatio
+        self.snr = SignalNoiseRatio()
 
     def forward(self, x):
         pass
@@ -73,11 +74,20 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         batch_text = batch_audio_text_dict['text']
         batch_audio = batch_audio_text_dict['waveform']
         device = batch_audio.device
-        
-        mixtures, segments = self.waveform_mixer(
-            waveforms=batch_audio
-        )
 
+        if self.waveform_mixer.num_conditions > 1:
+            mixtures, segments, target_indices = self.waveform_mixer(waveforms=batch_audio)
+            new_batch_text = []
+            for indices in target_indices:
+                target_text = [batch_text[i] for i in indices]
+                # target_text = ' '.join(target_text)
+                # new_batch_text.append(target_text)
+                new_batch_text += target_text
+            batch_text = new_batch_text
+        else:
+            mixtures, segments, _ = self.waveform_mixer(
+                waveforms=batch_audio
+            )
         # calculate text embed for audio-text data
         if self.query_encoder_type == 'CLAP':
             conditions = self.query_encoder.get_query_embed(
@@ -86,7 +96,8 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
                 audio=segments.squeeze(1),
                 use_text_ratio=self.use_text_ratio,
             )
-
+            if conditions.shape[0] != mixtures.shape[0]:
+                conditions = conditions.reshape(mixtures.shape[0], -1, conditions.shape[-1])
         input_dict = {
             'mixture': mixtures[:, None, :].squeeze(1),
             'condition': conditions,
@@ -108,13 +119,72 @@ class AudioSep(pl.LightningModule, PyTorchModelHubMixin):
         # Calculate loss.
         loss = self.loss_function(output_dict, target_dict)
 
-        self.log_dict({"train_loss": loss})
-        
+        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def test_step(self, batch, batch_idx):
         pass
-    
+
+    def validation_step(self, batch_data_dict, batch_idx):
+        r"""Run a forward pass on the validation batch and compute SNR.
+
+        Logs:
+            val/snr  : average SNR (dB) of the separated output vs target
+            val/snr_i: average SNR improvement (dB) over the input mixture
+        """
+
+        batch_audio_text_dict = batch_data_dict['audio_text']
+
+        batch_text = batch_audio_text_dict['text']
+        batch_audio = batch_audio_text_dict['waveform']
+        device = batch_audio.device
+
+        # prepare mixtures / segments similar to training
+        if self.waveform_mixer.num_conditions > 1:
+            mixtures, segments, target_indices = self.waveform_mixer(waveforms=batch_audio)
+            new_batch_text = []
+            for indices in target_indices:
+                target_text = [batch_text[i] for i in indices]
+                # target_text = ' '.join(target_text)
+                # new_batch_text.append(target_text)
+                new_batch_text += target_text
+            batch_text = new_batch_text
+        else:
+            mixtures, segments, _ = self.waveform_mixer(
+                waveforms=batch_audio
+            )
+        # calculate text embed for audio-text data
+        if self.query_encoder_type == 'CLAP':
+            conditions = self.query_encoder.get_query_embed(
+                modality='hybird',
+                text=batch_text,
+                audio=segments.squeeze(1),
+                use_text_ratio=self.use_text_ratio,
+            )
+            if conditions.shape[0] != mixtures.shape[0]:
+                conditions = conditions.reshape(mixtures.shape[0], -1, conditions.shape[-1])
+        input_dict = {
+            'mixture': mixtures[:, None, :].squeeze(1),
+            'condition': conditions,
+        }
+
+        target = segments.squeeze(1)
+
+        # run model in eval mode without grads
+        self.ss_model.eval()
+        with torch.no_grad():
+            sep_segment = self.ss_model(input_dict)['waveform']
+            sep_segment = sep_segment.squeeze()
+
+        # ensure shapes: (batch, samples)
+        pred = sep_segment
+        ref = target
+        pre_snr = torchmetrics.functional.signal_noise_ratio(mixtures, ref).mean()
+        snr = torchmetrics.functional.signal_noise_ratio(pred, ref).mean()
+        snr_i = snr - pre_snr
+        self.log('val/snr', snr, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('val/snr_i', snr_i, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)    
+
     def configure_optimizers(self):
         r"""Configure optimizer.
         """
@@ -149,6 +219,8 @@ def get_model_class(model_type):
     if model_type == 'ResUNet30':
         from models.resunet import ResUNet30
         return ResUNet30
-
+    elif model_type == 'ResUNet30_DP':
+        from models.resunet_dp import ResUNet30 as ResUNet30_DP
+        return ResUNet30_DP
     else:
         raise NotImplementedError

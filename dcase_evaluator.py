@@ -148,9 +148,11 @@ def eval(evaluator, checkpoint_path, config_yaml='config/audiosep_base.yaml', de
 if __name__ == '__main__':
     dcase_evaluator = DCASEEvaluator(
         sampling_rate=16000,
-        eval_indexes='lass_synthetic_validation.csv',
-        audio_dir='lass_validation',
+        eval_indexes='../dataset/lass/lass_synthetic_validation.csv',
+        audio_dir='../dataset/lass/lass_validation',
     )
 
-    checkpoint_path='audiosep_16k,baseline,step=200000.ckpt'
+    checkpoint_path='checkpoint/audiosep_16k,baseline,step=200000.ckpt'
     eval(dcase_evaluator, checkpoint_path, device = "cuda")
+    checkpoint_path='checkpoint/resunet_with_dprnn_16k/model-epoch=19-val_sdr=8.1018.ckpt'
+    eval(dcase_evaluator, checkpoint_path, config_yaml='config/audiosep_dp.yaml', device = "cuda")
